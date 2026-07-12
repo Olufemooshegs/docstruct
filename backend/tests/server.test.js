@@ -16,4 +16,43 @@ describe('DocStruct backend API', () => {
     expect(response.body.document).toHaveProperty('filename');
     expect(response.body.structuredContent).toHaveProperty('formattedContent');
   });
+
+  it('supports signup, OTP verification, and login', async () => {
+    const email = `auth-${Date.now()}@example.com`;
+
+    const signupResponse = await request(app)
+      .post('/api/auth/signup')
+      .send({
+        name: 'Test User',
+        email,
+        password: 'Password123'
+      });
+
+    expect(signupResponse.status).toBe(200);
+    expect(signupResponse.body.success).toBe(true);
+    expect(signupResponse.body.requiresVerification).toBe(true);
+    expect(signupResponse.body).toHaveProperty('otp');
+    expect(signupResponse.body).toHaveProperty('deliveryStatus');
+
+    const verifyResponse = await request(app)
+      .post('/api/auth/verify-otp')
+      .send({
+        email,
+        otp: signupResponse.body.otp
+      });
+
+    expect(verifyResponse.status).toBe(200);
+    expect(verifyResponse.body.success).toBe(true);
+
+    const loginResponse = await request(app)
+      .post('/api/auth/login')
+      .send({
+        email,
+        password: 'Password123'
+      });
+
+    expect(loginResponse.status).toBe(200);
+    expect(loginResponse.body.success).toBe(true);
+    expect(loginResponse.body).toHaveProperty('token');
+  });
 });
