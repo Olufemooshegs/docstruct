@@ -1,4 +1,5 @@
 const request = require('supertest');
+const JSZip = require('jszip');
 const app = require('../server');
 
 describe('DocStruct backend API', () => {
@@ -15,6 +16,16 @@ describe('DocStruct backend API', () => {
     expect(response.body.document).toHaveProperty('buffer');
     expect(response.body.document).toHaveProperty('filename');
     expect(response.body.structuredContent).toHaveProperty('formattedContent');
+
+    const decoded = Buffer.from(response.body.document.buffer, 'base64');
+    const zip = await JSZip.loadAsync(decoded);
+    const documentXml = await zip.file('word/document.xml').async('string');
+
+    expect(documentXml).toContain('Heading1');
+    expect(documentXml).toContain('Introduction');
+    expect(documentXml).toContain('Conclusion');
+    expect(documentXml).toContain('Title');
+    expect(documentXml).toContain('ListBullet');
   });
 
   it('supports signup, OTP verification, and login', async () => {
