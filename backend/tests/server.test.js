@@ -1,6 +1,52 @@
 const request = require('supertest');
 const JSZip = require('jszip');
+const fs = require('fs');
+const fsp = require('fs').promises;
+const os = require('os');
+const path = require('path');
+const PDFDocument = require('pdfkit');
 const app = require('../server');
+
+async function createSampleDocx(filePath) {
+  const zip = new JSZip();
+  zip.file('[Content_Types].xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+</Types>`);
+  zip.file('_rels/.rels', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+</Relationships>`);
+  zip.file('word/document.xml', `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>Sample converted document</w:t></w:r></w:p>
+    <w:p><w:r><w:t>Second paragraph for conversion testing.</w:t></w:r></w:p>
+  </w:body>
+</w:document>`);
+
+  const buffer = await zip.generateAsync({ type: 'nodebuffer' });
+  await fsp.writeFile(filePath, buffer);
+}
+
+async function createSamplePdf(filePath) {
+  const doc = new PDFDocument({ size: 'A4', margin: 54 });
+  const stream = fs.createWriteStream(filePath);
+  const finished = new Promise((resolve, reject) => {
+    stream.on('finish', resolve);
+    stream.on('error', reject);
+  });
+
+  doc.pipe(stream);
+  doc.fontSize(18).text('Sample PDF for conversion testing');
+  doc.moveDown();
+  doc.fontSize(12).text('This PDF is used to verify the PDF to DOCX endpoint.');
+  doc.end();
+
+  await finished;
+}
 
 describe('DocStruct backend API', () => {
   it('processes text input and returns a document payload', async () => {
@@ -26,6 +72,16 @@ describe('DocStruct backend API', () => {
     expect(documentXml).toContain('Conclusion');
     expect(documentXml).toContain('Title');
     expect(documentXml).toContain('ListBullet');
+  });
+
+  it('supports a permanent demo login', async () => {
+    const response = await request(app)
+      .post('/api/auth/demo-login');
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.user.email).toBe('demo@docstruct.ai');
+    expect(response.body).toHaveProperty('token');
   });
 
   it('supports signup, OTP verification, and login', async () => {
@@ -65,5 +121,46 @@ describe('DocStruct backend API', () => {
     expect(loginResponse.status).toBe(200);
     expect(loginResponse.body.success).toBe(true);
     expect(loginResponse.body).toHaveProperty('token');
+  });
+
+  it('converts DOCX files to downloadable PDFs', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'docstruct-docx-'));
+    const inputPath = path.join(tempDir, 'sample.docx');
+    await createSampleDocx(inputPath);
+
+    const response = await request(app)
+      .post('/api/convert/docx-to-pdf')
+      .attach('file', inputPath);
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.filename).toMatch(/\.pdf$/);
+    expect(response.body.downloadUrl).toContain('/api/download/');
+
+    const outputPath = response.body.filePath;
+    const outputBuffer = await fsp.readFile(outputPath);
+    expect(outputBuffer.toString('utf8', 0, 4)).toBe('%PDF');
+  });
+
+  it('converts PDFs to downloadable DOCX files', async () => {
+    const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'docstruct-pdf-'));
+    const inputPath = path.join(tempDir, 'sample.pdf');
+    await createSamplePdf(inputPath);
+
+    const response = await request(app)
+      .post('/api/convert/pdf-to-docx')
+      .attach('file', inputPath);
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.filename).toMatch(/\.docx$/);
+    expect(response.body.downloadUrl).toContain('/api/download/');
+
+    const outputPath = response.body.filePath;
+    const outputBuffer = await fsp.readFile(outputPath);
+    const zip = await JSZip.loadAsync(outputBuffer);
+    const documentXml = await zip.file('word/document.xml').async('string');
+
+    expect(documentXml).toContain('Sample PDF for conversion testing');
   });
 });
