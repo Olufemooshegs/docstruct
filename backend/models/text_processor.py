@@ -28,17 +28,37 @@ class DocumentStructure:
     confidence_scores: Dict[str, float]
 
 class AdvancedTextProcessor:
+    _shared_nlp = None
+    _shared_text_classifier = None
+    _shared_stop_words = None
+    _resources_ready = False
+
     def __init__(self):
-        # Initialize NLP models
-        self.nlp = spacy.load("en_core_web_sm")
-        self.text_classifier = pipeline("text-classification", model="distilbert-base-uncased-finetuned-sst-2-english")
-        
-        # Initialize NLTK resources
-        nltk.download('punkt', quiet=True)
-        nltk.download('stopwords', quiet=True)
-        nltk.download('averaged_perceptron_tagger', quiet=True)
-        
-        self.stop_words = set(stopwords.words('english'))
+        if not AdvancedTextProcessor._resources_ready:
+            AdvancedTextProcessor._shared_nlp = spacy.load("en_core_web_sm")
+            AdvancedTextProcessor._shared_text_classifier = pipeline(
+                "text-classification",
+                model="distilbert-base-uncased-finetuned-sst-2-english"
+            )
+
+            nltk.download('punkt', quiet=True)
+            nltk.download('stopwords', quiet=True)
+            nltk.download('averaged_perceptron_tagger', quiet=True)
+
+            AdvancedTextProcessor._shared_stop_words = set(stopwords.words('english'))
+            AdvancedTextProcessor._resources_ready = True
+
+        self.nlp = AdvancedTextProcessor._shared_nlp
+        self.text_classifier = AdvancedTextProcessor._shared_text_classifier
+        self.stop_words = AdvancedTextProcessor._shared_stop_words
+        self.heading_type_patterns = {
+            'introduction': ('introduction', 'intro', 'background'),
+            'methodology': ('methodology', 'methods', 'approach'),
+            'results': ('results', 'findings', 'analysis'),
+            'conclusion': ('conclusion', 'summary', 'discussion'),
+            'references': ('references', 'bibliography'),
+            'abstract': ('abstract',),
+        }
         
         # Document type patterns
         self.academic_patterns = {
@@ -200,21 +220,12 @@ class AdvancedTextProcessor:
     def detect_heading_type(self, heading_text: str) -> str:
         """Detect the type of heading"""
         text_lower = heading_text.lower()
-        
-        if any(pattern in text_lower for pattern in ['introduction', 'intro', 'background']):
-            return 'introduction'
-        elif any(pattern in text_lower for pattern in ['methodology', 'methods', 'approach']):
-            return 'methodology'
-        elif any(pattern in text_lower for pattern in ['results', 'findings', 'analysis']):
-            return 'results'
-        elif any(pattern in text_lower for pattern in ['conclusion', 'summary', 'discussion']):
-            return 'conclusion'
-        elif any(pattern in text_lower for pattern in ['references', 'bibliography']):
-            return 'references'
-        elif any(pattern in text_lower for pattern in ['abstract', 'abstract']):
-            return 'abstract'
-        else:
-            return 'general'
+
+        for heading_type, patterns in self.heading_type_patterns.items():
+            if any(pattern in text_lower for pattern in patterns):
+                return heading_type
+
+        return 'general'
 
     def group_related_content(self, sentences: List[str], structure: DocumentStructure) -> Dict:
         """Group related content based on detected structure"""

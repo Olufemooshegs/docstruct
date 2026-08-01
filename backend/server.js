@@ -22,12 +22,16 @@ const {
   AlignmentType
 } = require('docx');
 const { Pool } = require('pg');
+const jwt = require('jsonwebtoken');
+const cookieParser = require('cookie-parser');
 const PDFParser = require('pdf2json');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 const AUTH_STORE_PATH = path.join(__dirname, 'data', 'auth-store.json');
 const DATABASE_URL = process.env.DATABASE_URL;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
 const pendingOtps = new Map();
 let users = new Map();
@@ -73,7 +77,12 @@ function createOtp() {
 }
 
 function createToken(email) {
+  // Keep legacy base64 token for backward compatibility in responses
   return Buffer.from(`${email}:${Date.now()}`).toString('base64');
+}
+
+function createJwtToken(email) {
+  return jwt.sign({ email: String(email).toLowerCase() }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
 }
 
 function normalizeEmail(email) {
@@ -535,9 +544,19 @@ async function sendOtpEmail(email, otp, name) {
 
 // Middleware
 app.use(helmet());
-app.use(cors());
+// Allow credentials so httpOnly auth cookie can be set by the API
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // allow requests with no origin (e.g. curl, Postman)
+      callback(null, true);
+    },
+    credentials: true
+  })
+);
 app.use(compression());
 app.use(morgan('combined'));
+app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
@@ -693,14 +712,36 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(403).json({ error: 'Please verify your email first.' });
     }
 
-    res.json({
-      success: true,
-      token: createToken(normalizedEmail),
-      user: {
-        name: user.name,
-        email: normalizedEmail
-      }
-    });
+    try {
+      const jwtToken = createJwtToken(normalizedEmail);
+      // set httpOnly cookie
+      res.cookie('docstruct_token', jwtToken, {
+        httpOnly: true,
+        secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+        sameSite: 'lax',
+        maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
+      });
+
+      res.json({
+        success: true,
+        // keep legacy token in body for backward compatibility
+        token: createToken(normalizedEmail),
+        user: {
+          name: user.name,
+          email: normalizedEmail
+        }
+      });
+    } catch (err) {
+      console.error('Login -> cookie set error:', err);
+      res.json({
+        success: true,
+        token: createToken(normalizedEmail),
+        user: {
+          name: user.name,
+          email: normalizedEmail
+        }
+      });
+    }
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Failed to log in.' });
@@ -710,6 +751,14 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/demo-login', async (req, res) => {
   try {
     const demoUser = await ensureDemoUser();
+    const jwtToken = createJwtToken(demoUser.email);
+    res.cookie('docstruct_token', jwtToken, {
+      httpOnly: true,
+      secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+      sameSite: 'lax',
+      maxAge: 1000 * 60 * 60 * 24 * 7
+    });
+
     res.json({
       success: true,
       token: createToken(demoUser.email),
@@ -725,17 +774,32 @@ app.post('/api/auth/demo-login', async (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const token = authHeader.replace('Bearer ', '');
+  // Prefer cookie-based JWT, fall back to Authorization header legacy token
+  const cookieToken = req.cookies && req.cookies.docstruct_token;
 
-  if (!token) {
-    return res.status(401).json({ error: 'Missing token.' });
+  let email = null;
+
+  if (cookieToken) {
+    try {
+      const payload = jwt.verify(cookieToken, JWT_SECRET);
+      email = payload && payload.email;
+    } catch (err) {
+      // ignore and fall back
+    }
   }
 
-  const decoded = Buffer.from(token, 'base64').toString('utf8');
-  const [email] = decoded.split(':');
-  const user = findUserByEmail(email);
+  if (!email) {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ error: 'Missing token.' });
+    }
+    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    const parts = decoded.split(':');
+    email = parts[0];
+  }
 
+  const user = findUserByEmail(email);
   if (!user) {
     return res.status(401).json({ error: 'Invalid token.' });
   }
