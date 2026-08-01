@@ -928,6 +928,15 @@ app.post('/api/convert/docx-to-pdf', upload.single('file'), async (req, res) => 
     const downloadUrl = buildDownloadUrl(req, outputName);
 
     const stats = await fsp.stat(outputPath).catch(() => null);
+    // attempt to extract a small preview from the original DOCX
+    let previewExcerpt = null;
+    try {
+      const paras = await extractDocxParagraphs(req.file.path);
+      previewExcerpt = (paras && paras.length) ? String(paras.slice(0, 3).join('\n\n')).slice(0, 500) : null;
+    } catch (e) {
+      previewExcerpt = null;
+    }
+
     res.json({
       success: true,
       filename: outputName,
@@ -935,6 +944,7 @@ app.post('/api/convert/docx-to-pdf', upload.single('file'), async (req, res) => 
       downloadUrl,
       size: stats ? stats.size : null,
       mime: 'application/pdf',
+      previewExcerpt,
       note: 'DOCX-to-PDF conversion generated and available for download.'
     });
   } catch (error) {
@@ -965,6 +975,15 @@ app.post('/api/convert/pdf-to-docx', upload.single('file'), async (req, res) => 
     const downloadUrl = buildDownloadUrl(req, outputName);
 
     const stats = await fsp.stat(outputPath).catch(() => null);
+    // extract a small text preview from the uploaded PDF
+    let previewExcerpt = null;
+    try {
+      const extracted = await extractTextFromPDF(req.file.path);
+      previewExcerpt = String(extracted || '').slice(0, 500);
+    } catch (e) {
+      previewExcerpt = null;
+    }
+
     res.json({
       success: true,
       filename: outputName,
@@ -972,6 +991,7 @@ app.post('/api/convert/pdf-to-docx', upload.single('file'), async (req, res) => 
       downloadUrl,
       size: stats ? stats.size : null,
       mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      previewExcerpt,
       note: 'PDF-to-DOCX conversion generated and available for download.'
     });
   } catch (error) {
