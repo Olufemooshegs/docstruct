@@ -31,7 +31,11 @@ const PORT = process.env.PORT || 3001;
 const AUTH_STORE_PATH = path.join(__dirname, 'data', 'auth-store.json');
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
-const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
+const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
+const REFRESH_EXPIRES_IN_DAYS = Number(process.env.REFRESH_EXPIRES_IN_DAYS || 30);
+
+// Simple in-memory refresh token store: refreshToken -> { email, expiresAt }
+const refreshTokens = new Map();
 
 const pendingOtps = new Map();
 let users = new Map();
@@ -83,6 +87,29 @@ function createToken(email) {
 
 function createJwtToken(email) {
   return jwt.sign({ email: String(email).toLowerCase() }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+}
+
+function createRefreshToken() {
+  return require('crypto').randomBytes(32).toString('hex');
+}
+
+function setRefreshToken(email, token) {
+  const expiresAt = Date.now() + REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000;
+  refreshTokens.set(token, { email: String(email).toLowerCase(), expiresAt });
+}
+
+function revokeRefreshToken(token) {
+  refreshTokens.delete(token);
+}
+
+function validateRefreshToken(token) {
+  const entry = refreshTokens.get(token);
+  if (!entry) return null;
+  if (entry.expiresAt < Date.now()) {
+    refreshTokens.delete(token);
+    return null;
+  }
+  return entry.email;
 }
 
 function normalizeEmail(email) {
@@ -714,18 +741,27 @@ app.post('/api/auth/login', async (req, res) => {
 
     try {
       const jwtToken = createJwtToken(normalizedEmail);
-      // set httpOnly cookie
+      // create refresh token
+      const refreshToken = createRefreshToken();
+      setRefreshToken(normalizedEmail, refreshToken);
+
+      // set access cookie (short-lived) and refresh cookie (long-lived)
       res.cookie('docstruct_token', jwtToken, {
         httpOnly: true,
         secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
         sameSite: 'lax',
-        maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
+        maxAge: 1000 * 60 * 15 // 15 minutes
+      });
+
+      res.cookie('docstruct_refresh', refreshToken, {
+        httpOnly: true,
+        secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+        sameSite: 'lax',
+        maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
       });
 
       res.json({
         success: true,
-        // keep legacy token in body for backward compatibility
-        token: createToken(normalizedEmail),
         user: {
           name: user.name,
           email: normalizedEmail
@@ -735,7 +771,6 @@ app.post('/api/auth/login', async (req, res) => {
       console.error('Login -> cookie set error:', err);
       res.json({
         success: true,
-        token: createToken(normalizedEmail),
         user: {
           name: user.name,
           email: normalizedEmail
@@ -752,16 +787,25 @@ app.post('/api/auth/demo-login', async (req, res) => {
   try {
     const demoUser = await ensureDemoUser();
     const jwtToken = createJwtToken(demoUser.email);
+    const refreshToken = createRefreshToken();
+    setRefreshToken(demoUser.email, refreshToken);
+
     res.cookie('docstruct_token', jwtToken, {
       httpOnly: true,
       secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
       sameSite: 'lax',
-      maxAge: 1000 * 60 * 60 * 24 * 7
+      maxAge: 1000 * 60 * 15
+    });
+
+    res.cookie('docstruct_refresh', refreshToken, {
+      httpOnly: true,
+      secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+      sameSite: 'lax',
+      maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
     });
 
     res.json({
       success: true,
-      token: createToken(demoUser.email),
       user: {
         name: demoUser.name,
         email: demoUser.email
@@ -773,44 +817,67 @@ app.post('/api/auth/demo-login', async (req, res) => {
   }
 });
 
+// Refresh access token using refresh cookie
+app.post('/api/auth/refresh', (req, res) => {
+  const refreshToken = req.cookies && req.cookies.docstruct_refresh;
+  if (!refreshToken) return res.status(401).json({ error: 'Missing refresh token.' });
+
+  const email = validateRefreshToken(refreshToken);
+  if (!email) return res.status(401).json({ error: 'Invalid or expired refresh token.' });
+
+  // rotate refresh token
+  revokeRefreshToken(refreshToken);
+  const newRefresh = createRefreshToken();
+  setRefreshToken(email, newRefresh);
+
+  const jwtToken = createJwtToken(email);
+  res.cookie('docstruct_token', jwtToken, {
+    httpOnly: true,
+    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+    sameSite: 'lax',
+    maxAge: 1000 * 60 * 15
+  });
+
+  res.cookie('docstruct_refresh', newRefresh, {
+    httpOnly: true,
+    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
+    sameSite: 'lax',
+    maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
+  });
+
+  res.json({ success: true });
+});
+
+// Logout and revoke refresh token
+app.post('/api/auth/logout', (req, res) => {
+  const refreshToken = req.cookies && req.cookies.docstruct_refresh;
+  if (refreshToken) revokeRefreshToken(refreshToken);
+
+  res.clearCookie('docstruct_token');
+  res.clearCookie('docstruct_refresh');
+  res.json({ success: true });
+});
+
 app.get('/api/auth/me', (req, res) => {
-  // Prefer cookie-based JWT, fall back to Authorization header legacy token
   const cookieToken = req.cookies && req.cookies.docstruct_token;
 
-  let email = null;
-
-  if (cookieToken) {
-    try {
-      const payload = jwt.verify(cookieToken, JWT_SECRET);
-      email = payload && payload.email;
-    } catch (err) {
-      // ignore and fall back
-    }
+  if (!cookieToken) {
+    return res.status(401).json({ error: 'Missing token.' });
   }
 
-  if (!email) {
-    const authHeader = req.headers.authorization || '';
-    const token = authHeader.replace('Bearer ', '');
-    if (!token) {
-      return res.status(401).json({ error: 'Missing token.' });
-    }
-    const decoded = Buffer.from(token, 'base64').toString('utf8');
-    const parts = decoded.split(':');
-    email = parts[0];
-  }
+  try {
+    const payload = jwt.verify(cookieToken, JWT_SECRET);
+    const email = payload && payload.email;
+    const user = findUserByEmail(email);
+    if (!user) return res.status(401).json({ error: 'Invalid token.' });
 
-  const user = findUserByEmail(email);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid token.' });
+    return res.json({
+      success: true,
+      user: { name: user.name, email: user.email }
+    });
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired token.' });
   }
-
-  res.json({
-    success: true,
-    user: {
-      name: user.name,
-      email: user.email
-    }
-  });
 });
 
 // Process text input (for typed text)
@@ -860,12 +927,15 @@ app.post('/api/convert/docx-to-pdf', upload.single('file'), async (req, res) => 
 
     const downloadUrl = buildDownloadUrl(req, outputName);
 
+    const stats = await fsp.stat(outputPath).catch(() => null);
     res.json({
       success: true,
       filename: outputName,
       filePath: outputPath,
       downloadUrl,
-      note: 'DOCX-to-PDF conversion is generated locally and delivered as a downloadable PDF.'
+      size: stats ? stats.size : null,
+      mime: 'application/pdf',
+      note: 'DOCX-to-PDF conversion generated and available for download.'
     });
   } catch (error) {
     console.error('DOCX->PDF conversion error:', error);
@@ -894,12 +964,15 @@ app.post('/api/convert/pdf-to-docx', upload.single('file'), async (req, res) => 
 
     const downloadUrl = buildDownloadUrl(req, outputName);
 
+    const stats = await fsp.stat(outputPath).catch(() => null);
     res.json({
       success: true,
       filename: outputName,
       filePath: outputPath,
       downloadUrl,
-      note: 'PDF-to-DOCX conversion is generated locally and delivered as a downloadable DOCX.'
+      size: stats ? stats.size : null,
+      mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      note: 'PDF-to-DOCX conversion generated and available for download.'
     });
   } catch (error) {
     console.error('PDF->DOCX conversion error:', error);

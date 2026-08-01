@@ -81,7 +81,10 @@ describe('DocStruct backend API', () => {
     expect(response.status).toBe(200);
     expect(response.body.success).toBe(true);
     expect(response.body.user.email).toBe('demo@docstruct.ai');
-    expect(response.body).toHaveProperty('token');
+    // cookies should be set for access and refresh
+    const sc = response.headers['set-cookie'] || [];
+    expect(sc.some(s => s.startsWith('docstruct_token'))).toBe(true);
+    expect(sc.some(s => s.startsWith('docstruct_refresh'))).toBe(true);
   });
 
   it('supports signup, OTP verification, and login', async () => {
@@ -117,10 +120,11 @@ describe('DocStruct backend API', () => {
         email,
         password: 'Password123'
       });
-
     expect(loginResponse.status).toBe(200);
     expect(loginResponse.body.success).toBe(true);
-    expect(loginResponse.body).toHaveProperty('token');
+    const sc = loginResponse.headers['set-cookie'] || [];
+    expect(sc.some(s => s.startsWith('docstruct_token'))).toBe(true);
+    expect(sc.some(s => s.startsWith('docstruct_refresh'))).toBe(true);
   });
 
   it('converts DOCX files to downloadable PDFs', async () => {
