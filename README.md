@@ -257,3 +257,33 @@ Python ecosystem:
 
 
 # Example Workflow
+
+## Security & Deployment (Important)
+
+Set these environment variables in production and deploy behind HTTPS:
+
+- `JWT_SECRET`: a strong random secret used to sign access JWTs (required).
+- `NODE_ENV`: set to `production` to enable secure cookie flags.
+- `REFRESH_EXPIRES_IN_DAYS`: number of days refresh tokens remain valid (default: 30).
+
+Server/Runtime notes:
+
+- The backend issues short-lived access tokens as httpOnly cookies (`docstruct_token`) and a long-lived refresh cookie (`docstruct_refresh`). Keep cookies secure by serving over HTTPS and setting `NODE_ENV=production`.
+- To rotate secrets or revoke sessions, call the `/api/auth/logout` endpoint which clears cookies and revokes the refresh token. Use `/api/auth/refresh` to obtain a new access token using the refresh cookie.
+- Recommended deployment: run the API behind a TLS-terminating reverse proxy (NGINX, Cloud Run, App Service) and enforce HTTPS. Do not expose `JWT_SECRET` or refresh tokens in logs or client-side code.
+
+Example environment variables (Linux):
+
+```bash
+export JWT_SECRET="$(openssl rand -hex 32)"
+export NODE_ENV=production
+export REFRESH_EXPIRES_IN_DAYS=30
+```
+
+When deploying, ensure your platform is configured to forward secure cookies and set appropriate `Access-Control-Allow-Origin` values rather than allowing all origins.
+
+
+
+Lets not forget thje ability to update a file and get it into a document
+This is so important for the development and uniqueness of what we are building
+User uploads their file, the app reads, performs an OCR and generate a docx, then the dox is reedited into the format the use wants 
