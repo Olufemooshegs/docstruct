@@ -34,7 +34,20 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
 const REFRESH_EXPIRES_IN_DAYS = Number(process.env.REFRESH_EXPIRES_IN_DAYS || 30);
 
-// Simple in-memory refresh token store: refreshToken -> { email, expiresAt }
+// Redis optional support for refresh tokens
+const REDIS_URL = process.env.REDIS_URL || null;
+let redisClient = null;
+if (REDIS_URL) {
+  try {
+    const IORedis = require('ioredis');
+    redisClient = new IORedis(REDIS_URL);
+  } catch (err) {
+    console.warn('ioredis not installed or failed to init, falling back to DB:', err.message);
+    redisClient = null;
+  }
+}
+
+// In-memory fallback (only if neither Redis nor Postgres available)
 const refreshTokens = new Map();
 
 const pendingOtps = new Map();
@@ -93,16 +106,80 @@ function createRefreshToken() {
   return require('crypto').randomBytes(32).toString('hex');
 }
 
-function setRefreshToken(email, token) {
+async function setRefreshToken(email, token) {
   const expiresAt = Date.now() + REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000;
+  // Redis path
+  if (redisClient) {
+    await redisClient.set(`refresh:${token}`, JSON.stringify({ email: String(email).toLowerCase() }), 'PX', REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000);
+    return;
+  }
+
+  // Postgres path
+  if (pool) {
+    try {
+      await pool.query(
+        `INSERT INTO refresh_tokens(token, email, expires_at) VALUES ($1, $2, $3)
+         ON CONFLICT (token) DO UPDATE SET email = EXCLUDED.email, expires_at = EXCLUDED.expires_at`,
+        [token, String(email).toLowerCase(), expiresAt]
+      );
+      return;
+    } catch (err) {
+      console.warn('Failed to persist refresh token to Postgres:', err.message);
+    }
+  }
+
+  // In-memory fallback
   refreshTokens.set(token, { email: String(email).toLowerCase(), expiresAt });
 }
 
-function revokeRefreshToken(token) {
+async function revokeRefreshToken(token) {
+  if (redisClient) {
+    await redisClient.del(`refresh:${token}`);
+    return;
+  }
+
+  if (pool) {
+    try {
+      await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+      return;
+    } catch (err) {
+      console.warn('Failed to revoke refresh token in Postgres:', err.message);
+    }
+  }
+
   refreshTokens.delete(token);
 }
 
-function validateRefreshToken(token) {
+async function validateRefreshToken(token) {
+  if (!token) return null;
+
+  if (redisClient) {
+    const raw = await redisClient.get(`refresh:${token}`);
+    if (!raw) return null;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && parsed.email ? parsed.email : null;
+    } catch (err) {
+      return null;
+    }
+  }
+
+  if (pool) {
+    try {
+      const result = await pool.query('SELECT email, expires_at FROM refresh_tokens WHERE token = $1', [token]);
+      if (!result.rows.length) return null;
+      const row = result.rows[0];
+      if (Number(row.expires_at) < Date.now()) {
+        await pool.query('DELETE FROM refresh_tokens WHERE token = $1', [token]);
+        return null;
+      }
+      return row.email;
+    } catch (err) {
+      console.warn('Failed to validate refresh token in Postgres:', err.message);
+      return null;
+    }
+  }
+
   const entry = refreshTokens.get(token);
   if (!entry) return null;
   if (entry.expiresAt < Date.now()) {
