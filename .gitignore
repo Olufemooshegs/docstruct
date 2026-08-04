@@ -1,6 +1,5 @@
 node_modules/
 backend/node_modules/
-frontend/
 backend/uploads/
 backend/data/
 *.log
