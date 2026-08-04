@@ -1,0 +1,64 @@
+services:
+  - type: web
+    name: docstruct-backend
+    env: node
+    region: oregon
+    plan: free
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    disk:
+      name: uploads
+      mountPath: /opt/render/project/src/backend/uploads
+      sizeGB: 10
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 15m
+      - key: REFRESH_EXPIRES_IN_DAYS
+        value: 30
+      - key: COOKIE_SAME_SITE
+        value: none
+      - key: CORS_ORIGIN
+        value: https://docstruct-frontend.onrender.com
+      - key: MAIL_HOST
+        value: smtp.sendgrid.net
+      - key: MAIL_PORT
+        value: 587
+      - key: MAIL_SECURE
+        value: true
+      - key: MAIL_FROM
+        value: no-reply@docstruct.ai
+    autoDeploy: true
+
+  - type: web
+    name: docstruct-frontend
+    env: node
+    region: oregon
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: node .output/server/index.mjs
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: VITE_API_BASE_URL
+        value: https://docstruct-backend.onrender.com
+    autoDeploy: true
+
+databases:
+  - name: docstruct-db
+    databaseName: docstruct
+    user: docstruct
+    plan: free

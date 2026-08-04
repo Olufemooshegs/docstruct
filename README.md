@@ -103,187 +103,102 @@ Responsibilities:
 - Section detection
 - Semantic understanding
 - Document hierarchy generation
-
-
-Possible technologies:
-
-- Large Language Models (LLMs)
-- Natural Language Processing frameworks
-- Transformer models
-
-
-## 3. Document Generation Engine
-
-Converts structured information into professional documents.
-
-Responsibilities:
-
-- Creating Word documents
-- Applying templates
-- Managing formatting
-
-
-Technologies:
-
-- python-docx
-- Apache POI
-- LibreOffice APIs
-
-
-## 4. Backend API
-
-Handles communication between users, AI models, and document generation services.
-
-
-Possible technologies:
-
-### Backend
-
-- Python (FastAPI / Django)
-- Node.js (Express / NestJS)
-
-### Database
-
-- PostgreSQL
-- MongoDB
-
-### Storage
-
-- AWS S3
-- Google Cloud Storage
-- Azure Blob Storage
-
-
-# Recommended Technology Stack
-
-## Frontend
-
-A modern web interface for uploading content and managing documents.
-
-Recommended:
-
-- React.js
-- Next.js
-- TypeScript
-- Tailwind CSS
-
-
-## Backend
-
-Recommended:
-
-- Python FastAPI
-
-Reasons:
-
-- Excellent AI/ML ecosystem
-- High performance
-- Easy API development
-
-
-## Artificial Intelligence
-
-Possible approaches:
-
-### Large Language Models
-
-Using models for:
-
-- Understanding document context
-- Creating structure
-- Improving formatting decisions
-
-
-Options:
-
-- OpenAI API
-- Anthropic Claude API
-- Google Gemini API
-- Open-source models (Llama, Mistral)
-
-
-### NLP Libraries
-
-- Hugging Face Transformers
-- spaCy
-- NLTK
-
-
-## OCR
-
-For handwritten or scanned documents:
-
-Options:
-
-- Tesseract OCR
-- Google Cloud Vision API
-- Azure Computer Vision
-- PaddleOCR
-
-
-## Document Processing
-
-Python ecosystem:
-
-- python-docx
-- PyMuPDF
-- ReportLab
-
-
-# Development Roadmap
-
-## Phase 1: MVP
-
-- Text input interface
-- AI document structure detection
-- Word document generation
-- Basic templates
-
-
-## Phase 2: Advanced Processing
-
-- Image upload
-- OCR integration
-- Handwriting recognition
-- Better formatting intelligence
-
-
-## Phase 3: Professional Features
-
-- Citation management
-- Multiple templates
-- Collaboration
-- Cloud storage
-
-
-# Example Workflow
-
-## Security & Deployment (Important)
-
-Set these environment variables in production and deploy behind HTTPS:
-
-- `JWT_SECRET`: a strong random secret used to sign access JWTs (required).
-- `NODE_ENV`: set to `production` to enable secure cookie flags.
-- `REFRESH_EXPIRES_IN_DAYS`: number of days refresh tokens remain valid (default: 30).
-
-Server/Runtime notes:
-
-- The backend issues short-lived access tokens as httpOnly cookies (`docstruct_token`) and a long-lived refresh cookie (`docstruct_refresh`). Keep cookies secure by serving over HTTPS and setting `NODE_ENV=production`.
-- To rotate secrets or revoke sessions, call the `/api/auth/logout` endpoint which clears cookies and revokes the refresh token. Use `/api/auth/refresh` to obtain a new access token using the refresh cookie.
-- Recommended deployment: run the API behind a TLS-terminating reverse proxy (NGINX, Cloud Run, App Service) and enforce HTTPS. Do not expose `JWT_SECRET` or refresh tokens in logs or client-side code.
-
-Example environment variables (Linux):
-
-```bash
-export JWT_SECRET="$(openssl rand -hex 32)"
-export NODE_ENV=production
-export REFRESH_EXPIRES_IN_DAYS=30
+# DocStruct
+
+DocStruct is a full-stack application for converting raw text, scanned pages, or uploads into professionally structured Word and PDF documents using NLP and document generation tooling.
+
+This repository contains a Node.js/Express backend (backend/) and a Vite + React frontend (frontend/). The backend provides authentication (httpOnly cookie JWTs + refresh tokens), document generation and conversion endpoints, and optional persistence for refresh tokens using Postgres or Redis.
+
+Contents
+- backend/: Express API, conversion, auth, and migrations
+- frontend/: Vite + React UI
+- backend/migrations/: SQL migrations (Postgres)
+- backend/uploads/: generated and uploaded files
+
+Quickstart (developer)
+1. Install dependencies
+  - Backend:
+  ```powershell
+  cd backend
+  npm install
+  ```
+  - Frontend:
+  ```powershell
+  cd frontend
+  npm install
+  ```
+
+2. Run a local Postgres (recommended)
+- Option A: Docker (recommended, no host install)
+  ```bash
+  docker run --name docstruct-postgres -e POSTGRES_PASSWORD=postgrespw -e POSTGRES_DB=docstruct -p 5432:5432 -d postgres:15
+  export DATABASE_URL=postgresql://postgres:postgrespw@localhost:5432/docstruct
+  ```
+- Option B: Install locally (Windows Chocolatey / Installer) — set `DATABASE_URL` accordingly.
+
+3. Apply migrations
+  ```powershell
+  psql "$env:DATABASE_URL" -f backend/migrations/001_create_refresh_tokens.sql
+  ```
+
+4. Start backend and frontend
+  - Backend (dev):
+  ```powershell
+  cd backend
+  npm run dev
+  ```
+  - Frontend (dev):
+  ```powershell
+  cd frontend
+  npm run dev
+  ```
+
+Environment variables
+- `JWT_SECRET` (required) — strong secret for signing access JWTs
+- `NODE_ENV` — use `production` in production to enforce secure cookie flags
+- `REFRESH_EXPIRES_IN_DAYS` — default 30
+- `DATABASE_URL` — Postgres connection string (optional; if provided, refresh tokens persist in Postgres) 
+- `REDIS_URL` — Redis connection (optional; when set, refresh tokens use Redis)
+
+Authentication model
+- Short-lived access token stored in an httpOnly cookie named `docstruct_token`.
+- Long-lived opaque refresh token stored in an httpOnly cookie named `docstruct_refresh` and persisted server-side (Redis or Postgres) when available.
+- Endpoints: `/api/auth/signup`, `/api/auth/login`, `/api/auth/refresh`, `/api/auth/logout`, `/api/auth/me`.
+
+Database migration
+- A migration is included at `backend/migrations/001_create_refresh_tokens.sql` which creates the `refresh_tokens` table used when `DATABASE_URL` is set.
+
+File conversion and document generation
+- The backend exposes endpoints for conversion and generation (see `backend/server.js`).
+- Uploaded files and generated outputs are stored under `backend/uploads/` during development.
+
+Running tests
+- Backend tests:
+```powershell
+cd backend
+npm test
 ```
 
-When deploying, ensure your platform is configured to forward secure cookies and set appropriate `Access-Control-Allow-Origin` values rather than allowing all origins.
+Docker compose (optional)
+You can add a small `docker-compose.yml` (not included) to run Postgres + backend. The project is intentionally simple and can run behind a reverse proxy in production.
 
+Security & production notes
+- Always run behind HTTPS and set `NODE_ENV=production` so cookies are marked `Secure`.
+- Persist refresh tokens using Redis or Postgres for multi-instance deployments; do not rely on in-memory store.
+- Keep `JWT_SECRET` secret and rotate when necessary.
 
+Developer notes
+- Frontend API helper sends requests with `credentials: 'include'` to support cookie-based auth. See `frontend/src/lib/api.ts`.
+- Refresh token helpers in the backend support Redis and Postgres. If neither is configured the server falls back to an in-memory Map (development only).
 
-Lets not forget thje ability to update a file and get it into a document
-This is so important for the development and uniqueness of what we are building
-User uploads their file, the app reads, performs an OCR and generate a docx, then the dox is reedited into the format the use wants 
+Where to look
+- Backend entry: [backend/server.js](backend/server.js)
+- Frontend entry: [frontend/src/main.tsx](frontend/src/main.tsx)
+- Tests: [backend/tests](backend/tests)
+- Migrations: [backend/migrations](backend/migrations)
+
+Contributing
+- Open issues and PRs are welcome. Describe the feature, include tests where appropriate, and keep changes focused.
+
+License
+- MIT

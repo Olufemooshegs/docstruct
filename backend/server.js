@@ -30,9 +30,15 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const AUTH_STORE_PATH = path.join(__dirname, 'data', 'auth-store.json');
 const DATABASE_URL = process.env.DATABASE_URL;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
+const isProduction = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+const JWT_SECRET = process.env.JWT_SECRET || (isProduction ? '' : 'dev-secret-change-me');
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '15m';
 const REFRESH_EXPIRES_IN_DAYS = Number(process.env.REFRESH_EXPIRES_IN_DAYS || 30);
+const cookieSameSite = process.env.COOKIE_SAME_SITE || (isProduction ? 'none' : 'lax');
+const allowedOrigins = (process.env.CORS_ORIGIN || process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 // Redis optional support for refresh tokens
 const REDIS_URL = process.env.REDIS_URL || null;
@@ -53,6 +59,11 @@ const refreshTokens = new Map();
 const pendingOtps = new Map();
 let users = new Map();
 let pool = null;
+
+if (isProduction && !JWT_SECRET) {
+  console.error('JWT_SECRET is required in production. Set it before starting the server.');
+  process.exit(1);
+}
 
 function getDatabaseConfig() {
   if (DATABASE_URL) {
@@ -647,15 +658,24 @@ async function sendOtpEmail(email, otp, name) {
 }
 
 // Middleware
+app.set('trust proxy', 1);
 app.use(helmet());
-// Allow credentials so httpOnly auth cookie can be set by the API
 app.use(
   cors({
     origin: function (origin, callback) {
-      // allow requests with no origin (e.g. curl, Postman)
-      callback(null, true);
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      if (allowedOrigins.length === 0 || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error('Not allowed by CORS'));
     },
-    credentials: true
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
   })
 );
 app.use(compression());
@@ -825,15 +845,15 @@ app.post('/api/auth/login', async (req, res) => {
       // set access cookie (short-lived) and refresh cookie (long-lived)
       res.cookie('docstruct_token', jwtToken, {
         httpOnly: true,
-        secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-        sameSite: 'lax',
+        secure: isProduction,
+        sameSite: cookieSameSite,
         maxAge: 1000 * 60 * 15 // 15 minutes
       });
 
       res.cookie('docstruct_refresh', refreshToken, {
         httpOnly: true,
-        secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-        sameSite: 'lax',
+        secure: isProduction,
+        sameSite: cookieSameSite,
         maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
       });
 
@@ -869,15 +889,15 @@ app.post('/api/auth/demo-login', async (req, res) => {
 
     res.cookie('docstruct_token', jwtToken, {
       httpOnly: true,
-      secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-      sameSite: 'lax',
+      secure: isProduction,
+      sameSite: cookieSameSite,
       maxAge: 1000 * 60 * 15
     });
 
     res.cookie('docstruct_refresh', refreshToken, {
       httpOnly: true,
-      secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-      sameSite: 'lax',
+      secure: isProduction,
+      sameSite: cookieSameSite,
       maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
     });
 
@@ -910,15 +930,15 @@ app.post('/api/auth/refresh', (req, res) => {
   const jwtToken = createJwtToken(email);
   res.cookie('docstruct_token', jwtToken, {
     httpOnly: true,
-    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-    sameSite: 'lax',
+    secure: isProduction,
+    sameSite: cookieSameSite,
     maxAge: 1000 * 60 * 15
   });
 
   res.cookie('docstruct_refresh', newRefresh, {
     httpOnly: true,
-    secure: String(process.env.NODE_ENV || '').toLowerCase() === 'production',
-    sameSite: 'lax',
+    secure: isProduction,
+    sameSite: cookieSameSite,
     maxAge: REFRESH_EXPIRES_IN_DAYS * 24 * 60 * 60 * 1000
   });
 
