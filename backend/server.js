@@ -25,6 +25,7 @@ const { Pool } = require('pg');
 const jwt = require('jsonwebtoken');
 const cookieParser = require('cookie-parser');
 const PDFParser = require('pdf2json');
+const { structureDocument, deterministicFallbackDocument } = require('./services/structurer');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -687,13 +688,24 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 app.get('/api/download/:filename', async (req, res) => {
   try {
-    const filename = path.basename(String(req.params.filename || ''));
+    const rawFilename = String(req.params.filename || '');
+    const filename = path.basename(rawFilename);
 
-    if (!filename) {
-      return res.status(400).json({ error: 'A filename is required.' });
+    if (!filename || filename !== rawFilename || filename.includes('..') || path.isAbsolute(rawFilename)) {
+      return res.status(400).json({ error: 'Invalid filename.' });
     }
 
-    const filePath = path.join(__dirname, 'uploads', filename);
+    if (!/^[A-Za-z0-9._-]+$/.test(filename)) {
+      return res.status(400).json({ error: 'Unsafe filename.' });
+    }
+
+    const uploadsRoot = path.resolve(path.join(__dirname, 'uploads'));
+    const filePath = path.resolve(path.join(uploadsRoot, filename));
+
+    if (!filePath.startsWith(uploadsRoot)) {
+      return res.status(400).json({ error: 'Invalid path.' });
+    }
+
     await fsp.access(filePath);
     return res.download(filePath, filename);
   } catch (error) {
@@ -838,11 +850,9 @@ app.post('/api/auth/login', async (req, res) => {
 
     try {
       const jwtToken = createJwtToken(normalizedEmail);
-      // create refresh token
       const refreshToken = createRefreshToken();
-      setRefreshToken(normalizedEmail, refreshToken);
+      await setRefreshToken(normalizedEmail, refreshToken);
 
-      // set access cookie (short-lived) and refresh cookie (long-lived)
       res.cookie('docstruct_token', jwtToken, {
         httpOnly: true,
         secure: isProduction,
@@ -885,7 +895,7 @@ app.post('/api/auth/demo-login', async (req, res) => {
     const demoUser = await ensureDemoUser();
     const jwtToken = createJwtToken(demoUser.email);
     const refreshToken = createRefreshToken();
-    setRefreshToken(demoUser.email, refreshToken);
+    await setRefreshToken(demoUser.email, refreshToken);
 
     res.cookie('docstruct_token', jwtToken, {
       httpOnly: true,
@@ -915,17 +925,16 @@ app.post('/api/auth/demo-login', async (req, res) => {
 });
 
 // Refresh access token using refresh cookie
-app.post('/api/auth/refresh', (req, res) => {
+app.post('/api/auth/refresh', async (req, res) => {
   const refreshToken = req.cookies && req.cookies.docstruct_refresh;
   if (!refreshToken) return res.status(401).json({ error: 'Missing refresh token.' });
 
-  const email = validateRefreshToken(refreshToken);
+  const email = await validateRefreshToken(refreshToken);
   if (!email) return res.status(401).json({ error: 'Invalid or expired refresh token.' });
 
-  // rotate refresh token
-  revokeRefreshToken(refreshToken);
+  await revokeRefreshToken(refreshToken);
   const newRefresh = createRefreshToken();
-  setRefreshToken(email, newRefresh);
+  await setRefreshToken(email, newRefresh);
 
   const jwtToken = createJwtToken(email);
   res.cookie('docstruct_token', jwtToken, {
@@ -946,9 +955,9 @@ app.post('/api/auth/refresh', (req, res) => {
 });
 
 // Logout and revoke refresh token
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   const refreshToken = req.cookies && req.cookies.docstruct_refresh;
-  if (refreshToken) revokeRefreshToken(refreshToken);
+  if (refreshToken) await revokeRefreshToken(refreshToken);
 
   res.clearCookie('docstruct_token');
   res.clearCookie('docstruct_refresh');
@@ -1185,32 +1194,258 @@ async function extractTextFromTextFile(filePath) {
   }
 }
 
-// Process and structure text content using NLP
-async function processTextContent(text, type = 'academic', style = 'Professional') {
-  const sentences = text.split(/[.!?]+/).filter(s => s.trim());
-  const words = text.split(/\s+/).filter(w => w.trim());
+function normalizeRawText(text) {
+  return String(text || '')
+    .replace(/\r/g, ' ')
+    .replace(/\s+\n\s+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]+/g, ' ')
+    .trim();
+}
 
-  // Tokenize text
-  const tokens = tokenizer.tokenize(text);
+function splitIntoParagraphs(text) {
+  return String(text || '')
+    .split(/\n\s*\n+/)
+    .map((part) => part.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
 
-  // Detect document structure
-  const structure = detectDocumentStructure(text, tokens);
+function extractTitleCandidate(paragraphs) {
+  const cleaned = (paragraphs || []).filter((paragraph) => paragraph && paragraph.length > 0);
+  if (!cleaned.length) return 'Untitled Document';
 
-  // Group related content
-  const groupedContent = groupRelatedContent(sentences, structure);
+  const first = cleaned[0];
+  const title = first.replace(/^\s*[-•*]\s*/, '').trim();
+  if (title.length <= 180) return title;
+  return title.slice(0, 160).trim();
+}
 
-  // Apply formatting based on type
-  const formattedContent = await applyFormatting(groupedContent, type, style);
-  const preview = buildPreview(formattedContent, type, style);
+function buildStructuredDocumentFromText(text, type = 'academic') {
+  const normalized = normalizeRawText(text);
+  const paragraphs = splitIntoParagraphs(normalized);
+  const title = extractTitleCandidate(paragraphs);
+
+  const sectionPatterns = {
+    introduction: ['introduction', 'background', 'overview', 'context'],
+    methodology: ['methodology', 'methods', 'approach', 'procedure', 'design', 'materials'],
+    results: ['results', 'findings', 'analysis', 'data', 'observations'],
+    conclusion: ['conclusion', 'summary', 'discussion', 'implications'],
+    references: ['references', 'bibliography', 'citations', 'works cited']
+  };
+
+  const sectionLookup = {};
+  Object.keys(sectionPatterns).forEach((key) => {
+    sectionLookup[key] = [];
+  });
+
+  paragraphs.forEach((paragraph) => {
+    const lowered = paragraph.toLowerCase();
+    let matched = false;
+    Object.entries(sectionPatterns).forEach(([sectionName, patterns]) => {
+      if (matched) return;
+      if (patterns.some((pattern) => lowered.includes(pattern))) {
+        sectionLookup[sectionName].push(paragraph);
+        matched = true;
+      }
+    });
+    if (!matched) {
+      sectionLookup.introduction.push(paragraph);
+    }
+  });
+
+  const sections = [];
+  const sampleOrder = ['introduction', 'methodology', 'results', 'conclusion', 'references'];
+
+  sampleOrder.forEach((sectionName) => {
+    const content = sectionLookup[sectionName] || [];
+    if (!content.length) return;
+    const heading = sectionName.charAt(0).toUpperCase() + sectionName.slice(1);
+    sections.push({
+      heading,
+      level: 1,
+      content: content.slice(0, 3),
+      subsections: []
+    });
+  });
+
+  if (!sections.length) {
+    sections.push({
+      heading: 'Overview',
+      level: 1,
+      content: paragraphs.slice(0, 3),
+      subsections: []
+    });
+  }
 
   return {
-    originalText: text,
+    title,
+    type,
+    sections,
+    summary: normalized.slice(0, 300)
+  };
+}
+
+function validateStructuredDocument(document) {
+  if (!document || typeof document !== 'object') return false;
+  if (!document.title || typeof document.title !== 'string') return false;
+  if (!Array.isArray(document.sections) || document.sections.length === 0) return false;
+
+  return document.sections.every((section) => {
+    if (!section || typeof section !== 'object') return false;
+    if (!section.heading || typeof section.heading !== 'string') return false;
+    if (!Array.isArray(section.content)) return false;
+    if (!Array.isArray(section.subsections)) return false;
+    return true;
+  });
+}
+
+function repairStructuredDocument(document, text) {
+  if (!document || typeof document !== 'object') {
+    return buildStructuredDocumentFromText(text, 'academic');
+  }
+
+  const repaired = {
+    title: String(document.title || extractTitleCandidate(splitIntoParagraphs(normalizeRawText(text))))
+  };
+
+  repaired.sections = Array.isArray(document.sections) && document.sections.length
+    ? document.sections.map((section) => ({
+        heading: String(section && section.heading ? section.heading : 'Section'),
+        level: Number(section && section.level) || 1,
+        content: Array.isArray(section && section.content) ? section.content.filter(Boolean).map((item) => String(item)) : [],
+        subsections: Array.isArray(section && section.subsections) ? section.subsections.map((sub) => ({
+          heading: String(sub && sub.heading ? sub.heading : 'Subsection'),
+          level: Number(sub && sub.level) || 2,
+          content: Array.isArray(sub && sub.content) ? sub.content.filter(Boolean).map((item) => String(item)) : []
+        })) : []
+      }))
+    : buildStructuredDocumentFromText(text, 'academic').sections;
+
+  if (!repaired.sections.length) {
+    repaired.sections = buildStructuredDocumentFromText(text, 'academic').sections;
+  }
+
+  return repaired;
+}
+
+function fallbackKeywordDocument(text) {
+  const normalized = normalizeRawText(text);
+  const paragraphs = splitIntoParagraphs(normalized);
+
+  const headingMap = {
+    introduction: ['introduction', 'background', 'overview'],
+    methodology: ['methodology', 'methods', 'approach', 'procedure'],
+    results: ['results', 'findings', 'analysis', 'data'],
+    conclusion: ['conclusion', 'summary', 'discussion'],
+    references: ['references', 'bibliography', 'citations']
+  };
+
+  const sections = [];
+  Object.entries(headingMap).forEach(([sectionKey, patterns]) => {
+    const matches = paragraphs.filter((paragraph) => patterns.some((pattern) => paragraph.toLowerCase().includes(pattern)));
+    if (matches.length) {
+      sections.push({
+        heading: sectionKey.charAt(0).toUpperCase() + sectionKey.slice(1),
+        level: 1,
+        content: matches,
+        subsections: []
+      });
+    }
+  });
+
+  if (!sections.length) {
+    sections.push({
+      heading: 'Overview',
+      level: 1,
+      content: paragraphs.slice(0, 3),
+      subsections: []
+    });
+  }
+
+  return {
+    title: extractTitleCandidate(paragraphs),
+    sections,
+    summary: normalized.slice(0, 300)
+  };
+}
+
+function buildPreviewFromStructured(structuredDocument, type, style) {
+  const sections = Array.isArray(structuredDocument && structuredDocument.sections) ? structuredDocument.sections : [];
+  return {
+    title: structuredDocument && structuredDocument.title ? structuredDocument.title : 'Untitled Document',
+    style,
+    docType: type,
+    sections: sections.map((section) => ({
+      heading: section.heading,
+      body: Array.isArray(section.content) ? section.content.join(' ') : ''
+    }))
+  };
+}
+
+function createLegacyFormattedContent(structuredDocument, type, style) {
+  const sections = Array.isArray(structuredDocument && structuredDocument.sections) ? structuredDocument.sections : [];
+  const formatted = {};
+
+  sections.forEach((section, index) => {
+    const title = section.heading || `Section ${index + 1}`;
+    const content = Array.isArray(section.content) ? section.content.join(' ') : '';
+    formatted[title.toLowerCase().replace(/\s+/g, '_')] = {
+      title,
+      content,
+      wordCount: content.split(/\s+/).filter(Boolean).length,
+      formatting: {
+        type,
+        style,
+        font: 'Calibri',
+        fontSize: 11,
+        lineSpacing: 1.15,
+        margins: { top: 1, right: 1, bottom: 1, left: 1 },
+        alignment: 'left',
+        spacingBefore: index === 0 ? 180 : 120,
+        spacingAfter: 90,
+        numbered: index < 4,
+        bulletList: false
+      }
+    };
+  });
+
+  return formatted;
+}
+
+// Process and structure text content using the real structurer service.
+async function processTextContent(text, type = 'academic', style = 'Professional') {
+  const rawText = normalizeRawText(text);
+  const sentences = rawText.split(/[.!?]+/).filter((sentence) => sentence.trim());
+  const words = rawText.split(/\s+/).filter((word) => word.trim());
+
+  let finalStructured;
+  try {
+    finalStructured = await structureDocument(rawText, { type });
+  } catch (error) {
+    const message = error && error.message ? error.message : 'Document structuring failed.';
+
+    if (/OPENROUTER_API_KEY|OPENAI_API_KEY|not configured|configuration/i.test(message)) {
+      throw new Error('AI structuring is not configured. Set OPENROUTER_API_KEY in the environment.');
+    }
+
+    finalStructured = deterministicFallbackDocument(rawText);
+  }
+
+  const preview = buildPreviewFromStructured(finalStructured, type, style);
+  const formattedContent = createLegacyFormattedContent(finalStructured, type, style);
+
+  return {
+    originalText: rawText,
     wordCount: words.length,
     sentenceCount: sentences.length,
-    structure: structure,
-    groupedContent: groupedContent,
+    title: finalStructured.title,
+    structure: finalStructured,
+    structuredDocument: finalStructured,
+    groupedContent: finalStructured,
     formattedContent: formattedContent,
-    preview: preview
+    preview: preview,
+    sections: finalStructured.sections,
+    diagnostics: finalStructured.diagnostics || { path: 'failed', sectionCount: finalStructured.sections.length, headings: finalStructured.sections.map((section) => section.heading), subsectionCount: finalStructured.sections.reduce((count, section) => count + (Array.isArray(section.subsections) ? section.subsections.length : 0), 0), contentCoverage: 100, syntheticStructuralMetadata: false }
   };
 }
 
@@ -1375,10 +1610,40 @@ async function applyFormatting(content, type, style = 'Professional') {
 
 // Generate document (DOCX format)
 async function generateDocument(structuredContent, type, style = 'Professional') {
+  const baseContent = structuredContent || {};
+  const structuredSections = Array.isArray(baseContent.structuredDocument && baseContent.structuredDocument.sections)
+    ? baseContent.structuredDocument.sections
+    : Array.isArray(baseContent.sections)
+      ? baseContent.sections
+      : [];
+
   const sections = [];
 
-  Object.entries(structuredContent.formattedContent || {}).forEach(([section, data]) => {
-    if (data && data.content && data.content.trim()) {
+  if (structuredSections.length > 0) {
+    structuredSections.forEach((section, index) => {
+      const title = section.heading || `Section ${index + 1}`;
+      const content = Array.isArray(section.content)
+        ? section.content.join('\n\n')
+        : String(section.content || '');
+
+      if (content.trim()) {
+        sections.push({
+          type: title.toLowerCase().replace(/\s+/g, '_'),
+          title,
+          content,
+          formatting: {
+            type,
+            style,
+            numbered: index < 4,
+            bulletList: false
+          }
+        });
+      }
+    });
+  }
+
+  Object.entries(baseContent.formattedContent || {}).forEach(([section, data]) => {
+    if (data && data.content && data.content.trim() && !sections.some((item) => item.type === section)) {
       sections.push({
         type: section,
         title: data.title || section.charAt(0).toUpperCase() + section.slice(1),
@@ -1392,7 +1657,7 @@ async function generateDocument(structuredContent, type, style = 'Professional')
     sections.push({
       type: 'general',
       title: 'Document',
-      content: structuredContent.originalText || 'No content available.',
+      content: baseContent.originalText || 'No content available.',
       formatting: { type, style }
     });
   }
@@ -1403,22 +1668,20 @@ async function generateDocument(structuredContent, type, style = 'Professional')
   bodyXml.push(`<w:p><w:pPr><w:spacing w:after="180"/></w:pPr><w:r><w:t>${escapeXml(`Generated by DocStruct AI • ${capitalize(type)} • ${style}`)}</w:t></w:r></w:p>`);
 
   sections.forEach((section) => {
-    const titleStyle = section.type === 'introduction' ? 'Heading1' : 'Heading2';
+    const sectionLevel = Number(section.level ?? section.formatting?.level ?? 1);
+    const headingStyle = getHeadingStyleForLevel(sectionLevel);
     const prefix = section.formatting?.numbered ? `${getSectionNumber(section.type)}. ` : '';
-    const titleParagraph = `<w:p><w:pPr><w:pStyle w:val="${titleStyle}"/></w:pPr><w:r><w:t>${escapeXml(`${prefix}${section.title}`)}</w:t></w:r></w:p>`;
+    const titleParagraph = `<w:p><w:pPr><w:pStyle w:val="${headingStyle}"/></w:pPr><w:r><w:t>${escapeXml(`${prefix}${section.title}`)}</w:t></w:r></w:p>`;
 
-    const contentParagraphs = String(section.content)
-      .split(/\n\n+/)
+    const contentParagraphs = (Array.isArray(section.content)
+      ? section.content
+      : String(section.content || '').split(/\n\n+/)
+    )
+      .map((paragraph) => String(paragraph || '').trim())
       .filter(Boolean)
       .map((paragraph) => {
-        const normalizedParagraph = paragraph.trim();
-        const isBulletList = section.formatting?.bulletList || /\b(First|Second|Third|Next|Finally)\b/i.test(normalizedParagraph);
-
-        if (isBulletList) {
-          return buildParagraphXml(normalizedParagraph, 'ListBullet', true);
-        }
-
-        return buildParagraphXml(normalizedParagraph, null, false);
+        const explicitBulletList = isExplicitBulletListParagraph(paragraph);
+        return buildParagraphXml(paragraph, explicitBulletList ? 'ListBullet' : null, explicitBulletList);
       });
 
     bodyXml.push(titleParagraph, ...contentParagraphs);
@@ -1469,6 +1732,13 @@ async function generateDocument(structuredContent, type, style = 'Professional')
     <w:qFormat/>
     <w:pPr><w:spacing w:before="180" w:after="90"/></w:pPr>
     <w:rPr><w:b/><w:sz w:val="24"/></w:rPr>
+  </w:style>
+  <w:style w:type="paragraph" w:styleId="Heading3">
+    <w:name w:val="heading 3"/>
+    <w:basedOn w:val="Normal"/>
+    <w:qFormat/>
+    <w:pPr><w:spacing w:before="120" w:after="60"/></w:pPr>
+    <w:rPr><w:b/><w:sz w:val="22"/></w:rPr>
   </w:style>
   <w:style w:type="paragraph" w:styleId="Title">
     <w:name w:val="Title"/>
@@ -1524,6 +1794,18 @@ function getSectionNumber(sectionType) {
   const order = ['introduction', 'methodology', 'results', 'conclusion'];
   const index = order.indexOf(String(sectionType || '').toLowerCase());
   return index >= 0 ? String(index + 1) : '';
+}
+
+function getHeadingStyleForLevel(level) {
+  const normalizedLevel = Number(level) || 1;
+  if (normalizedLevel === 1) return 'Heading1';
+  if (normalizedLevel === 2) return 'Heading2';
+  if (normalizedLevel >= 3) return 'Heading3';
+  return 'Normal';
+}
+
+function isExplicitBulletListParagraph(paragraph) {
+  return /^\s*(?:[-*•]|\d+[.)])\s+/.test(String(paragraph || ''));
 }
 
 function buildParagraphXml(text, styleId = null, isBullet = false) {
