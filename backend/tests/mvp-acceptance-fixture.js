@@ -156,6 +156,9 @@ function getPathLabel(structured) {
     const path = getPathLabel(structured);
     const xml = document && document.buffer ? await JSZip.loadAsync(Buffer.from(document.buffer, 'base64')).then((zip) => zip.file('word/document.xml') ? zip.file('word/document.xml').async('string') : '').catch(() => '') : '';
 
+    const allowedPaths = testCase.allowedPaths || ['llm', 'repair', 'deterministic_source_fallback'];
+    const pathAllowed = allowedPaths.includes(path);
+
     const casePass = (
       status === 200 &&
       success &&
@@ -167,7 +170,8 @@ function getPathLabel(structured) {
       (!expected.mustKeepSourceHeadings || summary.headings.length >= expected.sectionCount) &&
       (!(expected.allowSyntheticOverview === false) || !isSyntheticOverview(structured, testCase.input)) &&
       (document && document.buffer ? true : false) &&
-      Boolean(xml && xml.includes('w:document'))
+      Boolean(xml && xml.includes('w:document')) &&
+      pathAllowed
     );
 
     if (!casePass) {
@@ -179,6 +183,8 @@ function getPathLabel(structured) {
     console.log('HTTP_STATUS=' + status);
     console.log('SUCCESS=' + success);
     console.log('STRUCTURING_PATH=' + path);
+    console.log('PATH_ALLOWED=' + pathAllowed);
+    console.log('ALLOWED_PATHS=' + allowedPaths.join(' | '));
     console.log('VALIDATION_PASSED=' + Boolean(structured && structured.validationPassed));
     console.log('REPAIR_USED=' + Boolean(structured && structured.repairUsed));
     console.log('FALLBACK_USED=' + Boolean(structured && structured.fallbackUsed));

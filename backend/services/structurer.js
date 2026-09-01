@@ -78,10 +78,13 @@ function parseJsonCandidate(content) {
     throw new Error('Empty response from provider.');
   }
 
+  const dedented = trimmed.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '');
+  const candidate = dedented || trimmed;
+
   try {
-    return JSON.parse(trimmed);
+    return JSON.parse(candidate);
   } catch (error) {
-    const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+    const jsonMatch = candidate.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       try {
         return JSON.parse(jsonMatch[0]);
@@ -91,6 +94,91 @@ function parseJsonCandidate(content) {
     }
     throw new Error('Malformed JSON response from provider.');
   }
+}
+
+function normalizeStructuredCandidate(candidate) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    throw new Error('Structured document payload must be an object.');
+  }
+
+  const ensureString = (value, fallback = 'Section') => {
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      return trimmed || fallback;
+    }
+    if (value === null || value === undefined) {
+      return fallback;
+    }
+    const coerced = String(value).trim();
+    return coerced || fallback;
+  };
+
+  const normalizeSubsections = (subsections) => {
+    if (!Array.isArray(subsections)) {
+      return [];
+    }
+
+    return subsections
+      .map((item) => {
+        if (!item || typeof item !== 'object') {
+          return null;
+        }
+
+        const normalized = normalizeStructuredCandidate({
+          title: item.title || item.heading || 'Subsection',
+          sections: [{
+            heading: item.heading || item.title || 'Subsection',
+            level: item.level,
+            content: item.content,
+            subsections: item.subsections
+          }]
+        });
+
+        return normalized.sections[0];
+      })
+      .filter(Boolean);
+  };
+
+  const sections = Array.isArray(candidate.sections) ? candidate.sections : [];
+  const normalizedSections = sections.map((section, index) => {
+    if (!section || typeof section !== 'object') {
+      return {
+        heading: `Section ${index + 1}`,
+        level: 1,
+        content: [''],
+        subsections: []
+      };
+    }
+
+    const heading = ensureString(section.heading || section.title || `Section ${index + 1}`, `Section ${index + 1}`);
+    const levelSource = Number(section.level);
+    const level = Number.isFinite(levelSource) ? Math.max(1, Math.min(3, Math.trunc(levelSource))) : 1;
+
+    const contentSource = section.content;
+    const content = Array.isArray(contentSource)
+      ? contentSource.map((entry) => ensureString(entry, '')).filter(Boolean)
+      : typeof contentSource === 'string'
+        ? [contentSource.trim()].filter(Boolean)
+        : [];
+
+    const subsections = normalizeSubsections(section.subsections);
+
+    return {
+      heading,
+      level,
+      content: content.length ? content : [''],
+      subsections
+    };
+  });
+
+  if (!normalizedSections.length) {
+    throw new Error('Structured document payload has no sections.');
+  }
+
+  return {
+    title: ensureString(candidate.title || 'Untitled Document', 'Untitled Document'),
+    sections: normalizedSections
+  };
 }
 
 function normalizeForComparison(value) {
@@ -460,20 +548,100 @@ function summarizeStructuredDocument(document) {
   };
 }
 
+function buildDiagnostics(metadata = {}) {
+  const validPaths = new Set(['llm', 'repair', 'deterministic_source_fallback', 'generic_fallback']);
+  const path = validPaths.has(metadata.path) ? metadata.path : 'generic_fallback';
+  const sectionCount = Number.isFinite(metadata.sectionCount) ? metadata.sectionCount : 0;
+  const subsectionCount = Number.isFinite(metadata.subsectionCount) ? metadata.subsectionCount : 0;
+  const contentCoverage = Number.isFinite(metadata.contentCoverage)
+    ? Number(metadata.contentCoverage)
+    : 0;
+
+  return {
+    path,
+    validationPassed: Boolean(metadata.validationPassed),
+    repairUsed: Boolean(metadata.repairUsed),
+    fallbackUsed: Boolean(metadata.fallbackUsed),
+    sourceStructureDetected: Boolean(metadata.sourceStructureDetected),
+    sectionCount,
+    headings: Array.isArray(metadata.headings) ? metadata.headings : [],
+    subsectionCount,
+    contentCoverage: Number(contentCoverage.toFixed(2)),
+    syntheticStructuralMetadata: Boolean(metadata.syntheticStructuralMetadata)
+  };
+}
+
+function createInternalDiagnostics() {
+  return {
+    providerCallAttempted: false,
+    providerCallSucceeded: false,
+    providerResponseReceived: false,
+    providerResponseParsed: false,
+    initialValidationPassed: false,
+    repairAttempted: false,
+    repairValidationPassed: false,
+    finalPath: 'generic_fallback',
+    failureStage: 'none'
+  };
+}
+
+function attachInternalDiagnostics(document, diagnostics, finalPath = 'generic_fallback', failureStage = 'none') {
+  if (!document || typeof document !== 'object') {
+    return document;
+  }
+
+  const allowedFailureStages = new Set(['none', 'provider', 'response_empty', 'json_parse', 'schema_validation', 'repair', 'unknown']);
+  const safeFailureStage = allowedFailureStages.has(failureStage) ? failureStage : 'unknown';
+  const safeFinalPath = ['llm', 'repair', 'deterministic_source_fallback', 'generic_fallback'].includes(finalPath)
+    ? finalPath
+    : 'generic_fallback';
+
+  Object.defineProperty(document, 'internalDiagnostics', {
+    value: {
+      ...createInternalDiagnostics(),
+      ...(diagnostics || {}),
+      finalPath: safeFinalPath,
+      failureStage: safeFailureStage
+    },
+    enumerable: false,
+    configurable: true,
+    writable: true
+  });
+
+  return document;
+}
+
 function attachStructuringMetadata(document, metadata = {}) {
   if (!document || typeof document !== 'object') {
     return document;
   }
 
   const coverageValue = Number.isFinite(metadata.contentCoverage) ? metadata.contentCoverage : 0;
+  const path = ['llm', 'repair', 'deterministic_source_fallback', 'generic_fallback'].includes(metadata.structuringPath)
+    ? metadata.structuringPath
+    : 'generic_fallback';
+  const summary = summarizeStructuredDocument(document);
 
   Object.assign(document, {
-    structuringPath: metadata.structuringPath || 'generic_fallback',
+    structuringPath: path,
     validationPassed: Boolean(metadata.validationPassed),
     repairUsed: Boolean(metadata.repairUsed),
     fallbackUsed: Boolean(metadata.fallbackUsed),
     sourceStructureDetected: Boolean(metadata.sourceStructureDetected),
     contentCoverage: Number(coverageValue.toFixed(2))
+  });
+
+  document.diagnostics = buildDiagnostics({
+    path,
+    validationPassed: Boolean(metadata.validationPassed),
+    repairUsed: Boolean(metadata.repairUsed),
+    fallbackUsed: Boolean(metadata.fallbackUsed),
+    sourceStructureDetected: Boolean(metadata.sourceStructureDetected),
+    sectionCount: summary.sectionCount,
+    headings: summary.headings,
+    subsectionCount: summary.subsectionCount,
+    contentCoverage: Number(coverageValue.toFixed(2)),
+    syntheticStructuralMetadata: Boolean(metadata.syntheticStructuralMetadata)
   });
 
   return document;
@@ -514,9 +682,12 @@ function normalizeStructuredDocument(document) {
   };
 }
 
-async function callStructurerModel(text, mode = 'primary', failureNotes = []) {
+async function callStructurerModel(text, mode = 'primary', failureNotes = [], diagnostics = createInternalDiagnostics()) {
   const apiKey = process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY;
+  diagnostics.providerCallAttempted = true;
+
   if (!apiKey) {
+    diagnostics.failureStage = 'provider';
     throw new Error('OPENROUTER_API_KEY is not configured.');
   }
 
@@ -534,36 +705,56 @@ async function callStructurerModel(text, mode = 'primary', failureNotes = []) {
   const model = process.env.OPENROUTER_MODEL || process.env.OPENAI_STRUCTURING_MODEL || DEFAULT_MODEL;
   const prompt = mode === 'repair' ? buildRepairPrompt(failureNotes) : systemPrompt;
 
-  const response = await client.chat.completions.create({
-    model,
-    temperature: 0.1,
-    response_format: {
-      type: 'json_schema',
-      json_schema: {
-        name: 'document_structure',
-        strict: true,
-        schema: structuredDocumentJsonSchema
-      }
-    },
-    messages: [
-      { role: 'system', content: prompt },
-      {
-        role: 'user',
-        content: `Document text to structure:\n\n${text}`
-      }
-    ]
-  });
+  try {
+    const response = await client.chat.completions.create({
+      model,
+      temperature: 0.1,
+      response_format: {
+        type: 'json_schema',
+        json_schema: {
+          name: 'document_structure',
+          strict: true,
+          schema: structuredDocumentJsonSchema
+        }
+      },
+      messages: [
+        { role: 'system', content: prompt },
+        {
+          role: 'user',
+          content: `Document text to structure:\n\n${text}`
+        }
+      ]
+    });
 
-  const content = response?.choices?.[0]?.message?.content;
-  if (!content) {
-    throw new Error('Empty response from provider.');
+    diagnostics.providerCallSucceeded = true;
+    const content = response?.choices?.[0]?.message?.content;
+    if (!content) {
+      diagnostics.providerResponseReceived = false;
+      diagnostics.failureStage = 'response_empty';
+      throw new Error('Empty response from provider.');
+    }
+
+    diagnostics.providerResponseReceived = true;
+
+    try {
+      const parsed = parseJsonCandidate(content);
+      diagnostics.providerResponseParsed = true;
+      return parsed;
+    } catch (error) {
+      diagnostics.failureStage = 'json_parse';
+      throw error;
+    }
+  } catch (error) {
+    if (diagnostics.failureStage === 'none') {
+      diagnostics.failureStage = 'provider';
+    }
+    throw error;
   }
-
-  return parseJsonCandidate(content);
 }
 
 async function structureDocument(text, options = {}) {
   const normalizedText = validateInput(text);
+  const diagnostics = createInternalDiagnostics();
 
   let parsedDocument;
   let structuringPath = 'generic_fallback';
@@ -573,9 +764,11 @@ async function structureDocument(text, options = {}) {
   const sourceStructureDetected = detectSourceHeadingEvidence(normalizedText).count > 0 || normalizedText.split(/\n+/).filter(Boolean).length > 2 || normalizedText.split(/\s+\n\s+/).length > 1;
 
   try {
-    parsedDocument = await callStructurerModel(normalizedText, 'primary');
+    parsedDocument = await callStructurerModel(normalizedText, 'primary', [], diagnostics);
   } catch (error) {
     const providerError = error && error.message ? error.message : 'Provider request failed.';
+    diagnostics.failureStage = diagnostics.failureStage === 'none' ? 'provider' : diagnostics.failureStage;
+
     if (providerError.includes('OPENROUTER_API_KEY') || providerError.includes('OPENAI_API_KEY')) {
       throw new Error('AI structuring is not configured. Set OPENROUTER_API_KEY in the environment.');
     }
@@ -593,6 +786,7 @@ async function structureDocument(text, options = {}) {
       finalStructuredDocument = sourcePreservingFallback;
       fallbackUsed = true;
       structuringPath = 'deterministic_source_fallback';
+      diagnostics.finalPath = structuringPath;
       finalStructuredDocument = attachStructuringMetadata(finalStructuredDocument, {
         structuringPath,
         validationPassed: qualityCheck.isValid,
@@ -601,25 +795,40 @@ async function structureDocument(text, options = {}) {
         sourceStructureDetected,
         contentCoverage: qualityCheck.coverage.coverage
       });
+      attachInternalDiagnostics(finalStructuredDocument, diagnostics, structuringPath, diagnostics.failureStage || 'provider');
       return finalStructuredDocument;
     }
 
     try {
-      parsedDocument = await callStructurerModel(normalizedText, 'repair', ['The initial provider response failed.']);
+      diagnostics.repairAttempted = true;
+      parsedDocument = await callStructurerModel(normalizedText, 'repair', ['The initial provider response failed.'], diagnostics);
     } catch (repairError) {
+      diagnostics.failureStage = 'repair';
       throw new Error(providerError || 'Structured document repair failed.');
     }
   }
 
+  try {
+    parsedDocument = normalizeStructuredCandidate(parsedDocument);
+  } catch (error) {
+    diagnostics.failureStage = 'schema_validation';
+  }
+
   let validated = documentStructureSchema.safeParse(parsedDocument);
+  diagnostics.initialValidationPassed = validated.success;
   if (!validated.success) {
+    diagnostics.failureStage = 'schema_validation';
     try {
-      const repairAttempt = await callStructurerModel(normalizedText, 'repair', ['The previous output failed schema validation.']);
-      validated = documentStructureSchema.safeParse(repairAttempt);
+      diagnostics.repairAttempted = true;
+      const repairAttempt = await callStructurerModel(normalizedText, 'repair', ['The previous output failed schema validation.'], diagnostics);
+      const normalizedRepair = normalizeStructuredCandidate(repairAttempt);
+      validated = documentStructureSchema.safeParse(normalizedRepair);
+      diagnostics.repairValidationPassed = validated.success;
       if (validated.success) {
-        parsedDocument = repairAttempt;
+        parsedDocument = normalizedRepair;
       }
     } catch (repairError) {
+      diagnostics.failureStage = 'repair';
       finalStructuredDocument = deterministicFallbackDocument(normalizedText);
       finalStructuredDocument = attachStructuringMetadata(finalStructuredDocument, {
         structuringPath: 'generic_fallback',
@@ -629,19 +838,24 @@ async function structureDocument(text, options = {}) {
         sourceStructureDetected,
         contentCoverage: detectStructureQualityIssues(normalizedText, finalStructuredDocument).coverage.coverage
       });
+      attachInternalDiagnostics(finalStructuredDocument, diagnostics, 'generic_fallback', 'repair');
       return finalStructuredDocument;
     }
   }
 
   if (!validated.success) {
+    diagnostics.failureStage = 'schema_validation';
     finalStructuredDocument = deterministicFallbackDocument(normalizedText);
-    finalStructuredDocument.diagnostics = buildDiagnostics({
-      path: 'failed',
-      sourceText: normalizedText,
-      structuredDocument: finalStructuredDocument,
-      qualityCheck: detectStructureQualityIssues(normalizedText, finalStructuredDocument),
+    finalStructuredDocument = attachStructuringMetadata(finalStructuredDocument, {
+      structuringPath: 'generic_fallback',
+      validationPassed: false,
+      repairUsed,
+      fallbackUsed: true,
+      sourceStructureDetected,
+      contentCoverage: detectStructureQualityIssues(normalizedText, finalStructuredDocument).coverage.coverage,
       syntheticStructuralMetadata: true
     });
+    attachInternalDiagnostics(finalStructuredDocument, diagnostics, 'generic_fallback', 'schema_validation');
     return finalStructuredDocument;
   }
 
@@ -650,8 +864,10 @@ async function structureDocument(text, options = {}) {
 
   if (!qualityCheck.isValid) {
     try {
-      const repairAttempt = await callStructurerModel(normalizedText, 'repair', qualityCheck.issues);
+      diagnostics.repairAttempted = true;
+      const repairAttempt = await callStructurerModel(normalizedText, 'repair', qualityCheck.issues, diagnostics);
       const repairParse = documentStructureSchema.safeParse(repairAttempt);
+      diagnostics.repairValidationPassed = repairParse.success;
       if (repairParse.success) {
         structuredDocument = normalizeStructuredDocument(repairParse.data);
         qualityCheck = detectStructureQualityIssues(normalizedText, structuredDocument);
@@ -659,6 +875,7 @@ async function structureDocument(text, options = {}) {
         structuringPath = 'repair';
       }
     } catch (repairError) {
+      diagnostics.failureStage = 'repair';
       structuredDocument = repairBySourceStructure(normalizedText);
       qualityCheck = detectStructureQualityIssues(normalizedText, structuredDocument);
     }
@@ -683,6 +900,9 @@ async function structureDocument(text, options = {}) {
       sourceStructureDetected,
       contentCoverage: detectStructureQualityIssues(normalizedText, finalStructuredDocument).coverage.coverage
     });
+    diagnostics.finalPath = 'generic_fallback';
+    diagnostics.failureStage = diagnostics.failureStage === 'none' ? 'unknown' : diagnostics.failureStage;
+    attachInternalDiagnostics(finalStructuredDocument, diagnostics, 'generic_fallback', diagnostics.failureStage === 'none' ? 'unknown' : diagnostics.failureStage);
     return finalStructuredDocument;
   }
 
@@ -690,6 +910,8 @@ async function structureDocument(text, options = {}) {
     structuringPath = 'llm';
   }
 
+  diagnostics.finalPath = structuringPath;
+  diagnostics.failureStage = 'none';
   finalStructuredDocument = structuredDocument;
   finalStructuredDocument = attachStructuringMetadata(finalStructuredDocument, {
     structuringPath,
@@ -699,6 +921,7 @@ async function structureDocument(text, options = {}) {
     sourceStructureDetected,
     contentCoverage: qualityCheck.coverage.coverage
   });
+  attachInternalDiagnostics(finalStructuredDocument, diagnostics, structuringPath, 'none');
 
   return finalStructuredDocument;
 }

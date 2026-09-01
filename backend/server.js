@@ -1433,6 +1433,20 @@ async function processTextContent(text, type = 'academic', style = 'Professional
 
   const preview = buildPreviewFromStructured(finalStructured, type, style);
   const formattedContent = createLegacyFormattedContent(finalStructured, type, style);
+  const diagnostics = finalStructured.diagnostics || {
+    path: finalStructured.structuringPath || 'generic_fallback',
+    validationPassed: Boolean(finalStructured.validationPassed),
+    repairUsed: Boolean(finalStructured.repairUsed),
+    fallbackUsed: Boolean(finalStructured.fallbackUsed),
+    sourceStructureDetected: Boolean(finalStructured.sourceStructureDetected),
+    sectionCount: Array.isArray(finalStructured.sections) ? finalStructured.sections.length : 0,
+    headings: Array.isArray(finalStructured.sections) ? finalStructured.sections.map((section) => section.heading).filter(Boolean) : [],
+    subsectionCount: Array.isArray(finalStructured.sections)
+      ? finalStructured.sections.reduce((count, section) => count + (Array.isArray(section.subsections) ? section.subsections.length : 0), 0)
+      : 0,
+    contentCoverage: Number(finalStructured.contentCoverage ?? 0),
+    syntheticStructuralMetadata: false
+  };
 
   return {
     originalText: rawText,
@@ -1445,7 +1459,13 @@ async function processTextContent(text, type = 'academic', style = 'Professional
     formattedContent: formattedContent,
     preview: preview,
     sections: finalStructured.sections,
-    diagnostics: finalStructured.diagnostics || { path: 'failed', sectionCount: finalStructured.sections.length, headings: finalStructured.sections.map((section) => section.heading), subsectionCount: finalStructured.sections.reduce((count, section) => count + (Array.isArray(section.subsections) ? section.subsections.length : 0), 0), contentCoverage: 100, syntheticStructuralMetadata: false }
+    structuringPath: finalStructured.structuringPath || diagnostics.path || 'generic_fallback',
+    validationPassed: Boolean(finalStructured.validationPassed),
+    repairUsed: Boolean(finalStructured.repairUsed),
+    fallbackUsed: Boolean(finalStructured.fallbackUsed),
+    sourceStructureDetected: Boolean(finalStructured.sourceStructureDetected),
+    contentCoverage: Number(finalStructured.contentCoverage ?? diagnostics.contentCoverage ?? 0),
+    diagnostics
   };
 }
 

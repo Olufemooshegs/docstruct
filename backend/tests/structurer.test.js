@@ -21,7 +21,7 @@ describe('structurer service', () => {
     delete process.env.OPENAI_API_KEY;
   });
 
-  it('validates a real structured response', async () => {
+  it('classifies a valid provider response as llm', async () => {
     process.env.OPENROUTER_API_KEY = 'test-key';
     mockCreate.mockResolvedValue({
       choices: [{
@@ -45,11 +45,116 @@ describe('structurer service', () => {
 
     expect(result.title).toBe('Research Notes');
     expect(result.sections[0].heading).toBe('Introduction');
-    expect(result.diagnostics.path).toBe('llm_success');
+    expect(result.structuringPath).toBe('llm');
+    expect(result.validationPassed).toBe(true);
+    expect(result.repairUsed).toBe(false);
+    expect(result.fallbackUsed).toBe(false);
+    expect(result.internalDiagnostics.failureStage).toBe('none');
+    expect(result.internalDiagnostics.finalPath).toBe('llm');
+    expect(result.structuringPath).not.toBe('failed');
     expect(documentStructureSchema.safeParse({ title: result.title, sections: result.sections }).success).toBe(true);
   });
 
-  it('marks repaired provider output as llm_repaired', async () => {
+  it('normalizes provider output with missing fields and coercible types before validation', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate.mockResolvedValueOnce({
+      choices: [{ message: { content: JSON.stringify({
+        title: 'Research Notes',
+        sections: [{
+          heading: 'Introduction',
+          level: '1',
+          content: 'This project studies a new workflow.'
+        }]
+      }) } }]
+    });
+
+    const result = await structureDocument('Introduction\nThis project studies a new workflow.');
+
+    expect(result.structuringPath).toBe('llm');
+    expect(result.internalDiagnostics.initialValidationPassed).toBe(true);
+    expect(result.title).toBe('Research Notes');
+    expect(result.sections[0].heading).toBe('Introduction');
+    expect(result.sections[0].level).toBe(1);
+    expect(result.sections[0].content).toEqual(['This project studies a new workflow.']);
+    expect(result.sections[0].subsections).toEqual([]);
+  });
+
+  it('classifies malformed JSON as provider parse failure and repair/fallback path', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate
+      .mockResolvedValueOnce({ choices: [{ message: { content: '{bad json' } }] })
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          title: 'Recovered Document',
+          sections: [{ heading: 'Introduction', level: 1, content: ['Recovered text.'], subsections: [] }]
+        }) } }]
+      });
+
+    const result = await structureDocument('Some text');
+
+    expect(result.structuringPath).toBe('llm');
+    expect(result.internalDiagnostics.failureStage).toBe('none');
+    expect(result.internalDiagnostics.providerResponseParsed).toBe(true);
+    expect(result.repairUsed).toBe(false);
+  });
+
+  it('classifies schema-invalid JSON as repair/fallback path', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate
+      .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ title: '', sections: [] }) } }] })
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          title: 'Recovered Document',
+          sections: [{ heading: 'Introduction', level: 1, content: ['Recovered text.'], subsections: [] }]
+        }) } }]
+      });
+
+    const result = await structureDocument('Some text');
+
+    expect(result.structuringPath).toBe('llm');
+    expect(result.internalDiagnostics.initialValidationPassed).toBe(false);
+    expect(result.internalDiagnostics.failureStage).toBe('none');
+    expect(result.title).toBe('Recovered Document');
+  });
+
+  it('classifies provider timeout as deterministic_source_fallback when source structure exists', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate.mockRejectedValue(new Error('timeout'));
+
+    const sourceText = [
+      'Introduction',
+      'This paper studies the issue and explains why the project matters.',
+      '',
+      'Background',
+      'The background explains the context and the problem statement in detail.',
+      '',
+      'Methodology',
+      'The team reviewed the available notes and grouped them by theme before drafting.',
+      '',
+      'Results',
+      'The results show that better structure reduces confusion in the drafting process.',
+      '',
+      'Conclusion',
+      'The project concludes that preserving structure improves academic clarity.'
+    ].join('\n');
+
+    const result = await structureDocument(sourceText);
+
+    expect(result.structuringPath).toBe('deterministic_source_fallback');
+    expect(result.internalDiagnostics.failureStage).toBe('provider');
+    expect(result.fallbackUsed).toBe(true);
+    expect(result.repairUsed).toBe(false);
+    expect(result.sections.length).toBeGreaterThan(1);
+  });
+
+  it('classifies provider failure with unstructured source as generic_fallback', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate.mockRejectedValue(new Error('timeout'));
+
+    await expect(structureDocument('A short sample paragraph.')).rejects.toThrow();
+  });
+
+  it('classifies repaired provider output as repair', async () => {
     process.env.OPENROUTER_API_KEY = 'test-key';
     mockCreate
       .mockResolvedValueOnce({
@@ -61,7 +166,11 @@ describe('structurer service', () => {
 
     const result = await structureDocument('Introduction\nRecovered text.');
 
-    expect(result.diagnostics.path).toBe('llm_repaired');
+    expect(result.structuringPath).toBe('repair');
+    expect(result.repairUsed).toBe(true);
+    expect(result.fallbackUsed).toBe(false);
+    expect(result.validationPassed).toBe(true);
+    expect(result.structuringPath).not.toBe('failed');
     expect(result.title).toBe('Recovered Document');
   });
 
@@ -240,7 +349,7 @@ describe('structurer service', () => {
     expect(result.sections.some((section) => /Conclusion/i.test(section.heading))).toBe(true);
   });
 
-  it('uses source-preserving fallback when the provider times out on structured input', async () => {
+  it('classifies source-preserving fallback as deterministic_source_fallback when provider times out on structured input', async () => {
     process.env.OPENROUTER_API_KEY = 'test-key';
     mockCreate.mockRejectedValue(new Error('timeout'));
 
@@ -263,10 +372,38 @@ describe('structurer service', () => {
 
     const result = await structureDocument(sourceText);
 
-    expect(result.diagnostics.path).toBe('source_preserving_fallback');
+    expect(result.structuringPath).toBe('deterministic_source_fallback');
+    expect(result.fallbackUsed).toBe(true);
+    expect(result.repairUsed).toBe(false);
+    expect(result.validationPassed).toBe(true);
+    expect(result.structuringPath).not.toBe('failed');
     expect(result.sections.length).toBeGreaterThan(1);
     expect(result.sections.some((section) => /Introduction/i.test(section.heading))).toBe(true);
     expect(result.sections.some((section) => /Background/i.test(section.heading))).toBe(true);
     expect(result.sections.some((section) => /Conclusion/i.test(section.heading))).toBe(true);
+  });
+
+  it('classifies a generic fallback when no source structure is available', () => {
+    const result = deterministicFallbackDocument('A short sample paragraph.');
+
+    expect(result.structuringPath).toBe('generic_fallback');
+    expect(result.fallbackUsed).toBe(true);
+    expect(result.repairUsed).toBe(false);
+    expect(result.structuringPath).not.toBe('failed');
+    expect(result.sections[0].heading).toBe('Overview');
+  });
+
+  it('never emits failed as a successful structuring path', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: JSON.stringify({
+        title: 'Valid Document',
+        sections: [{ heading: 'Introduction', level: 1, content: ['Text.'], subsections: [] }]
+      }) } }]
+    });
+
+    const result = await structureDocument('Text.');
+    expect(result.structuringPath).toBe('llm');
+    expect(result.structuringPath).not.toBe('failed');
   });
 });
