@@ -39,8 +39,8 @@ services:
     region: oregon
     plan: free
     rootDir: frontend
-    buildCommand: npm install && npm run build
-    startCommand: node .output/server/index.mjs
+    buildCommand: npm ci && npm run build
+    startCommand: node server-node.mjs
     healthCheckPath: /
     envVars:
       - key: NODE_ENV
