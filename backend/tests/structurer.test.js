@@ -79,6 +79,48 @@ describe('structurer service', () => {
     expect(result.sections[0].subsections).toEqual([]);
   });
 
+  it('repairs a schema-valid provider payload that collapses explicit headings', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          title: 'Academic Draft',
+          sections: [{
+            heading: 'Overview',
+            level: 1,
+            content: ['The source contains several academic sections.'],
+            subsections: []
+          }]
+        }) } }]
+      })
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          title: 'Academic Draft',
+          sections: [
+            { heading: 'Introduction', level: '1', content: 'The introduction explains the study.' },
+            { heading: 'Background', level: '1', content: 'The background explains the context.' },
+            { heading: 'Conclusion', level: '1', content: 'The conclusion summarizes the result.' }
+          ]
+        }) } }]
+      });
+
+    const result = await structureDocument([
+      'Introduction',
+      'The introduction explains the study.',
+      '',
+      'Background',
+      'The background explains the context.',
+      '',
+      'Conclusion',
+      'The conclusion summarizes the result.'
+    ].join('\n'));
+
+    expect(result.structuringPath).toBe('repair');
+    expect(result.internalDiagnostics.initialValidationPassed).toBe(true);
+    expect(result.internalDiagnostics.schemaValidationIssues).toEqual([]);
+    expect(result.sections.map((section) => section.heading)).toEqual(['Introduction', 'Background', 'Conclusion']);
+  });
+
   it('classifies malformed JSON as provider parse failure and repair/fallback path', async () => {
     process.env.OPENROUTER_API_KEY = 'test-key';
     mockCreate
@@ -347,6 +389,28 @@ describe('structurer service', () => {
     expect(result.sections.some((section) => /Introduction/i.test(section.heading))).toBe(true);
     expect(result.sections.some((section) => /Methodology/i.test(section.heading))).toBe(true);
     expect(result.sections.some((section) => /Conclusion/i.test(section.heading))).toBe(true);
+  });
+
+  it('classifies a valid one-section source recovery after repair failure as deterministic fallback', async () => {
+    process.env.OPENROUTER_API_KEY = 'test-key';
+    mockCreate
+      .mockResolvedValueOnce({
+        choices: [{ message: { content: JSON.stringify({
+          title: 'Document',
+          sections: [{ heading: 'Overview', level: 1, content: ['Unrelated output.'], subsections: [] }]
+        }) } }]
+      })
+      .mockResolvedValueOnce({ choices: [{ message: { content: 'not-json' } }] });
+
+    const result = await structureDocument([
+      'Introduction',
+      'This source paragraph must be preserved exactly.'
+    ].join('\n'));
+
+    expect(result.structuringPath).toBe('deterministic_source_fallback');
+    expect(result.validationPassed).toBe(true);
+    expect(result.sections).toHaveLength(1);
+    expect(result.sections[0].heading).toBe('Introduction');
   });
 
   it('classifies source-preserving fallback as deterministic_source_fallback when provider times out on structured input', async () => {
