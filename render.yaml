@@ -39,7 +39,7 @@ services:
     region: oregon
     plan: free
     rootDir: frontend
-    buildCommand: npm ci && npm run build
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: node server-node.mjs
     healthCheckPath: /
     envVars:
